@@ -6,8 +6,9 @@ __pycache__/
 # Virtual environments
 .env
 .venv
-env/
+.venv*/
 venv/
+env/
 ENV/
 
 # OS generated files
