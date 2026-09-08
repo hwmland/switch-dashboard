@@ -171,7 +171,57 @@ You can add the OVS switch from the dashboard's `/config` web interface or direc
 
 ---
 
-## 🛠️ System Architecture
+## � Generic Linux Host Integration
+
+Any Linux machine reachable over SSH (Debian, Ubuntu, or a Proxmox VE node) can be monitored as a "switch". The dashboard reads interface state and counters from `/sys/class/net`, the layer-2 forwarding database via `bridge fdb show`, and the neighbour table via `ip neigh show`. On Proxmox hosts, LXC/VM names are resolved automatically so virtual interfaces are labelled with their guest.
+
+Use this when the host is **not** running Open vSwitch. For OVS bridges, use `"model": "openvswitch"` instead (see above).
+
+### 1. Create a Dedicated SSH Monitoring User
+1. Add the user on the Linux host:
+   ```bash
+   sudo adduser linux-monitor
+   ```
+2. Grant restricted passwordless sudo so the MAC table can be read:
+   ```bash
+   sudo visudo
+   ```
+   Append the following line (drop `pct`/`qm` if the host is not Proxmox):
+   ```text
+   linux-monitor ALL=(ALL) NOPASSWD: /usr/sbin/bridge, /usr/sbin/pct, /usr/sbin/qm
+   ```
+   *(Verify the paths on your host with `which bridge pct qm`.)*
+
+Sudo is optional — without it the host still reports interfaces, counters, and system information, but the MAC table falls back to the ARP/neighbour table only. `python3` must be installed on the host (it is by default on Debian, Ubuntu, and Proxmox).
+
+### 2. Configure the Linux Host in Switch Dashboard
+Add the host from the `/config` web interface or directly in `config.json` with `"model": "linux"` (`proxmox`, `debian`, and `ubuntu` are accepted aliases):
+```json
+{
+  "name": "Proxmox Node",
+  "ip": "192.168.1.15",
+  "username": "linux-monitor",
+  "password": "your-password-here",
+  "model": "linux",
+  "bridge": "",
+  "include_vm_ports": false,
+  "port_count": 8
+}
+```
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `username` | `linux-monitor` | SSH user on the Linux host. |
+| `password` | `""` | SSH password (key-based auth is not supported). |
+| `bridge` | `""` | Optional. Restrict the port list to one bridge and its members. Empty means show everything. |
+| `include_vm_ports` | `false` | Include `veth*` / `tap*` / `fwln*` guest interfaces as ports. |
+| `port_count` | `8` | Placeholder port count used only when the host is unreachable. |
+
+By default the port list contains physical NICs, bridges, VLAN interfaces, and bonds — `lo` and container/VM interfaces are hidden. Jumbo frame status is derived from the largest MTU in use, and IGMP status from the bridge's `multicast_snooping` flag. Config backup and reboot actions are not supported for Linux hosts.
+
+---
+
+## �🛠️ System Architecture
 
 ```mermaid
 graph TD

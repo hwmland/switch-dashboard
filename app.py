@@ -522,9 +522,11 @@ def update_cache():
                 speeds[ip] = {}
                 continue
 
-            from scraper import HCSwitchScraper, OVSScraper, FritzBoxScraper
+            from scraper import HCSwitchScraper, OVSScraper, FritzBoxScraper, LinuxScraper
             if model_lower in ["openvswitch", "ovs"]:
                 scraper_obj = OVSScraper(sw)
+            elif model_lower in ["linux", "proxmox", "debian", "ubuntu"]:
+                scraper_obj = LinuxScraper(sw)
             elif model_lower == "fritzbox":
                 scraper_obj = FritzBoxScraper(sw)
             else:
@@ -1301,10 +1303,12 @@ def refresh_mac(ip):
         return jsonify({"status": "ok", "count": 0, "mac_table": []})
         
     try:
-        from scraper import HCSwitchScraper, OVSScraper, FritzBoxScraper
+        from scraper import HCSwitchScraper, OVSScraper, FritzBoxScraper, LinuxScraper
         model_lower = sw.get("model", "").lower()
         if model_lower in ["openvswitch", "ovs"]:
             scraper_obj = OVSScraper(sw)
+        elif model_lower in ["linux", "proxmox", "debian", "ubuntu"]:
+            scraper_obj = LinuxScraper(sw)
         elif model_lower == "fritzbox":
             scraper_obj = FritzBoxScraper(sw)
         else:
@@ -1343,10 +1347,12 @@ def get_transceiver(ip):
         return jsonify({"error": "No transceiver data available for virtual Internet node"}), 404
         
     try:
-        from scraper import HCSwitchScraper, OVSScraper, FritzBoxScraper
+        from scraper import HCSwitchScraper, OVSScraper, FritzBoxScraper, LinuxScraper
         model_lower = sw.get("model", "").lower()
         if model_lower in ["openvswitch", "ovs"]:
             scraper_obj = OVSScraper(sw)
+        elif model_lower in ["linux", "proxmox", "debian", "ubuntu"]:
+            scraper_obj = LinuxScraper(sw)
         elif model_lower == "fritzbox":
             scraper_obj = FritzBoxScraper(sw)
         else:

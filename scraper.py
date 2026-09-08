@@ -2152,6 +2152,600 @@ print(json.dumps(data))
         }
 
 
+class LinuxScraper:
+    """Scrapes a generic Linux host (Debian/Ubuntu, often Proxmox VE) over SSH.
+
+    Reads interface state and counters from /sys/class/net, the layer-2
+    forwarding database via `bridge fdb show`, and the neighbour (ARP) table via
+    `ip neigh show`. When the host is running Proxmox VE, LXC/VM names are
+    resolved from `pct list` / `qm list` so virtual interfaces can be labelled.
+    """
+
+    VM_IFACE_PREFIXES = ("veth", "tap", "fwln", "fwpr", "fwbr")
+
+    def __init__(self, config):
+        self.name = config["name"]
+        self.ip = config["ip"]
+        self.username = config.get("username", "linux-monitor")
+        self.password = config.get("password", "")
+        self.bridge = config.get("bridge", "")
+        self.port_count = config.get("port_count", 8)
+        self.model = config.get("model", "linux")
+        self.include_vm_ports = bool(config.get("include_vm_ports", False))
+        self._cached_data = None
+        self._cache_time = 0
+
+    def _get_data(self):
+        if self._cached_data and (time.time() - self._cache_time < 5.0):
+            return self._cached_data
+        data = self._scrape_linux()
+        self._cached_data = data
+        self._cache_time = time.time()
+        return data
+
+    def scrape(self):
+        return self._get_data()
+
+    def scrape_mac_table(self):
+        return self._get_data().get("mac_table", [])
+
+    def scrape_dhcp_snooping(self):
+        return self._get_data().get("dhcp_snooping", {"enabled": False, "ports": {}})
+
+    def scrape_igmp(self):
+        return self._get_data().get("igmp", {"enabled": False, "entries": []})
+
+    def scrape_jumbo_frame(self):
+        return self._get_data().get("jumbo_frame", {"enabled": False, "size": "Disabled"})
+
+    def scrape_transceiver(self):
+        return None
+
+    def download_backup(self):
+        return b""
+
+    def reboot_switch(self):
+        return "Not supported for Linux hosts."
+
+    # ------------------------------------------------------------------ #
+    # Remote collection
+    # ------------------------------------------------------------------ #
+
+    REMOTE_SCRIPT = """
+import subprocess
+import json
+import os
+
+# Non-root logins often miss /usr/sbin, where `bridge`, `pct` and `qm` live.
+os.environ["PATH"] = os.environ.get("PATH", "") + ":/usr/sbin:/sbin:/usr/local/sbin"
+
+def run_cmd(cmd):
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+        return res.stdout, res.stderr
+    except Exception as e:
+        return "", str(e)
+
+def run_privileged(cmd):
+    # Try via sudo, then unprivileged (sudo may be absent or not permitted).
+    out, err = run_cmd("sudo -n " + cmd)
+    if out.strip():
+        return out, err
+    return run_cmd(cmd)
+
+def read_text(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+def read_int(path, default=0):
+    try:
+        return int(read_text(path, ""))
+    except Exception:
+        return default
+
+data = {}
+
+# --- system information -------------------------------------------------
+data["hostname"] = read_text("/proc/sys/kernel/hostname", "linux")
+data["kernel"] = run_cmd("uname -r")[0].strip()
+
+distro = ""
+for line in read_text("/etc/os-release").splitlines():
+    if line.startswith("PRETTY_NAME="):
+        distro = line.split("=", 1)[1].strip().strip(chr(34))
+        break
+data["distro"] = distro or "Linux"
+
+uptime_str = ""
+try:
+    secs = float(read_text("/proc/uptime").split()[0])
+    d = int(secs // 86400)
+    h = int((secs % 86400) // 3600)
+    m = int((secs % 3600) // 60)
+    if d > 0:
+        uptime_str = str(d) + "d " + str(h) + "h " + str(m) + "m"
+    elif h > 0:
+        uptime_str = str(h) + "h " + str(m) + "m"
+    else:
+        uptime_str = str(m) + "m"
+except Exception:
+    pass
+data["uptime"] = uptime_str
+
+# --- Proxmox VE detection and guest names -------------------------------
+is_pve = os.path.exists("/etc/pve") or os.path.exists("/usr/bin/pveversion")
+data["is_proxmox"] = is_pve
+data["pve_version"] = ""
+vm_names = {}
+if is_pve:
+    pve_out, _ = run_cmd("pveversion")
+    lines = pve_out.strip().splitlines()
+    if lines:
+        data["pve_version"] = lines[0].strip()
+
+    pct_out, _ = run_privileged("pct list")
+    for line in pct_out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("VMID"):
+            continue
+        parts = line.split()
+        if len(parts) >= 3:
+            vm_names[parts[0]] = "LXC " + parts[0] + " (" + parts[-1] + ")"
+
+    qm_out, _ = run_privileged("qm list")
+    for line in qm_out.splitlines():
+        line = line.strip()
+        if not line or "VMID" in line:
+            continue
+        parts = line.split()
+        if len(parts) >= 3:
+            vm_names[parts[0]] = "VM " + parts[0] + " (" + parts[1] + ")"
+data["vm_names"] = vm_names
+
+# --- network interfaces -------------------------------------------------
+interfaces = {}
+try:
+    devs = sorted(os.listdir("/sys/class/net/"))
+except Exception:
+    devs = []
+
+for dev in devs:
+    base = "/sys/class/net/" + dev
+
+    uevent = {}
+    for line in read_text(base + "/uevent").splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            uevent[k] = v
+
+    is_bridge = os.path.isdir(base + "/bridge")
+    members = []
+    if is_bridge:
+        try:
+            members = sorted(os.listdir(base + "/brif"))
+        except Exception:
+            members = []
+
+    try:
+        master = os.path.basename(os.readlink(base + "/master"))
+    except Exception:
+        master = ""
+
+    stats = {}
+    for sfile in ["tx_bytes", "rx_bytes", "tx_packets", "rx_packets",
+                  "tx_errors", "rx_errors", "tx_dropped", "rx_dropped"]:
+        stats[sfile] = read_int(base + "/statistics/" + sfile)
+
+    interfaces[dev] = {
+        "devtype": uevent.get("DEVTYPE", ""),
+        "physical": os.path.exists(base + "/device"),
+        "bridge": is_bridge,
+        "members": members,
+        "master": master,
+        "mac": read_text(base + "/address").upper(),
+        "mtu": read_int(base + "/mtu", 1500),
+        "speed": read_int(base + "/speed", 0),
+        "duplex": read_text(base + "/duplex"),
+        "operstate": read_text(base + "/operstate", "unknown"),
+        "carrier": read_int(base + "/carrier", -1),
+        "multicast_snooping": read_int(base + "/bridge/multicast_snooping", 0),
+        "stats": stats,
+    }
+data["interfaces"] = interfaces
+
+# --- assigned IP addresses ---------------------------------------------
+addresses = {}
+addr_out, _ = run_cmd("ip -o addr show")
+for line in addr_out.splitlines():
+    parts = line.split()
+    if len(parts) >= 4 and parts[2] in ("inet", "inet6"):
+        addresses.setdefault(parts[1], []).append(parts[3])
+data["addresses"] = addresses
+
+# --- layer 2 forwarding database ---------------------------------------
+fdb_out, _ = run_privileged("bridge fdb show")
+data["fdb"] = fdb_out
+
+# --- neighbour (ARP/NDP) table -----------------------------------------
+neigh_out, _ = run_cmd("ip neigh show")
+data["neigh"] = neigh_out
+
+print(json.dumps(data))
+"""
+
+    def _scrape_linux(self):
+        import paramiko
+        import json
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(self.ip, username=self.username,
+                           password=self.password, timeout=15)
+            stdin, stdout, stderr = client.exec_command("python3")
+            stdin.write(self.REMOTE_SCRIPT)
+            stdin.close()
+
+            out = stdout.read().decode("utf-8", "replace")
+            err = stderr.read().decode("utf-8", "replace")
+            client.close()
+
+            if not out.strip():
+                logger.error(f"[LinuxScraper] Remote python error on {self.ip}: {err}")
+                raise Exception(err or "No output from remote python3")
+
+            return self._parse_scraped_data(json.loads(out.strip()))
+        except Exception as e:
+            logger.error(f"[LinuxScraper] Failed to scrape Linux host {self.name} ({self.ip}): {e}")
+            try:
+                client.close()
+            except Exception:
+                pass
+            return self._fallback()
+
+    # ------------------------------------------------------------------ #
+    # Parsing helpers
+    # ------------------------------------------------------------------ #
+
+    def _is_vm_iface(self, dev):
+        return dev.startswith(self.VM_IFACE_PREFIXES)
+
+    def _iface_rank(self, dev, info):
+        if self._is_vm_iface(dev):
+            return 4
+        if info.get("devtype") == "vlan":
+            return 3
+        if info.get("bridge"):
+            return 2
+        if info.get("devtype") == "bond":
+            return 1
+        return 0
+
+    def _select_ports(self, interfaces):
+        """Pick which interfaces are shown as switch "ports"."""
+        selected = []
+        for dev, info in interfaces.items():
+            if dev == "lo":
+                continue
+
+            devtype = info.get("devtype", "")
+            if self._is_vm_iface(dev) or devtype in ("veth", "tun"):
+                if not self.include_vm_ports:
+                    continue
+            elif not (info.get("physical") or info.get("bridge") or
+                      devtype in ("vlan", "bond")):
+                continue
+
+            if self.bridge:
+                bridge_info = interfaces.get(self.bridge, {})
+                if dev != self.bridge and info.get("master") != self.bridge \
+                        and dev not in bridge_info.get("members", []):
+                    continue
+
+            selected.append(dev)
+
+        selected.sort(key=lambda d: (self._iface_rank(d, interfaces[d]), d))
+        return selected
+
+    @staticmethod
+    def _format_speed(mbps):
+        if mbps >= 1000:
+            if mbps % 1000 == 0:
+                return f"{int(mbps / 1000)}G"
+            return f"{mbps / 1000:.1f}".rstrip("0").rstrip(".") + "G"
+        if mbps > 0:
+            return f"{mbps}M"
+        return ""
+
+    def _resolve_speed(self, dev, info, interfaces, _depth=0):
+        """Return the link speed in Mbps, deriving it for virtual interfaces.
+
+        The kernel reports a "speed" value for bridges, VLANs, veth and tap
+        devices too, but it is either an inflated aggregate (bridges) or a
+        blind copy of a value that may itself be wrong (VLANs stacked on a
+        bridge). Only trust the raw sysfs value for physical NICs; every
+        virtual interface resolves through its bridge/parent/master chain,
+        falling back to its own reported speed only as a last resort.
+        """
+        if info.get("physical"):
+            return info.get("speed", 0) or 0
+        if _depth > 4:
+            return info.get("speed", 0) or 0
+
+        if info.get("bridge"):
+            # Only physical members give a meaningful uplink speed.
+            member_speeds = [interfaces.get(m, {}).get("speed", 0)
+                             for m in info.get("members", [])
+                             if interfaces.get(m, {}).get("physical")]
+            member_speeds = [s for s in member_speeds if s and s > 0]
+            if member_speeds:
+                return max(member_speeds)
+
+        # VLAN / bonded / virtual interfaces inherit from their lower device.
+        parent = dev.split(".")[0].split("@")[0]
+        if parent != dev and parent in interfaces:
+            parent_speed = self._resolve_speed(
+                parent, interfaces[parent], interfaces, _depth + 1)
+            if parent_speed > 0:
+                return parent_speed
+
+        master = info.get("master")
+        if master and master in interfaces:
+            master_speed = self._resolve_speed(
+                master, interfaces[master], interfaces, _depth + 1)
+            if master_speed > 0:
+                return master_speed
+
+        return info.get("speed", 0) or 0
+
+    @staticmethod
+    def _link_status(info):
+        operstate = (info.get("operstate") or "unknown").lower()
+        if operstate == "up":
+            return "up"
+        if operstate in ("down", "lowerlayerdown"):
+            return "down"
+        return "up" if info.get("carrier", -1) == 1 else "down"
+
+    def _vm_label(self, dev, vm_names):
+        """Map a Proxmox virtual interface (veth100i0, tap101i0) to a guest name."""
+        if not self._is_vm_iface(dev):
+            return None
+        m = re.search(r"(?:veth|tap|fwln|fwpr|fwbr)(\d+)", dev)
+        if not m:
+            return None
+        vmid = m.group(1)
+        full_name = vm_names.get(vmid)
+        if not full_name:
+            return f"VM/LXC {vmid}"
+        short = re.search(r"\(([^)]+)\)", full_name)
+        return short.group(1) if short else full_name
+
+    @staticmethod
+    def _is_unicast(mac):
+        try:
+            return not (int(mac.split(":")[0], 16) & 1)
+        except (ValueError, IndexError):
+            return False
+
+    def _parse_fdb(self, fdb_text):
+        """Parse `bridge fdb show` output into entry dicts."""
+        entries = []
+        for line in fdb_text.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+
+            mac = parts[0].upper()
+            if mac.count(":") != 5 or not self._is_unicast(mac):
+                continue
+
+            dev, vlan, flags = "", "", []
+            i = 1
+            while i < len(parts):
+                token = parts[i]
+                if token in ("dev", "vlan", "master", "dst", "vni",
+                             "src_vni", "port", "via") and i + 1 < len(parts):
+                    if token == "dev":
+                        dev = parts[i + 1]
+                    elif token == "vlan":
+                        vlan = parts[i + 1]
+                    i += 2
+                else:
+                    flags.append(token)
+                    i += 1
+
+            if not dev:
+                continue
+
+            entries.append({
+                "mac": mac,
+                "type": "static" if ("permanent" in flags or "static" in flags) else "dynamic",
+                "port": dev,
+                "vlan": vlan or "1",
+            })
+        return entries
+
+    def _parse_neighbours(self, neigh_text):
+        """Parse `ip neigh show` into {MAC: {"ip": ..., "dev": ...}}."""
+        neighbours = {}
+        for line in neigh_text.splitlines():
+            parts = line.split()
+            if len(parts) < 5 or "lladdr" not in parts:
+                continue
+            if parts[-1].lower() in ("failed", "incomplete"):
+                continue
+
+            mac = parts[parts.index("lladdr") + 1].upper()
+            if mac.count(":") != 5 or not self._is_unicast(mac):
+                continue
+
+            dev = parts[parts.index("dev") + 1] if "dev" in parts else ""
+            address = parts[0]
+            if address.lower().startswith("fe80:"):
+                continue
+
+            existing = neighbours.get(mac)
+            # Prefer IPv4 over IPv6 for the displayed address.
+            if existing and ":" not in existing["ip"]:
+                continue
+            neighbours[mac] = {"ip": address, "dev": dev}
+        return neighbours
+
+    def _build_mac_table(self, data, port_names, port_vm_labels):
+        """Merge the bridge FDB (primary) with the ARP/NDP table (enrichment)."""
+        neighbours = self._parse_neighbours(data.get("neigh", ""))
+        mac_table, seen = [], set()
+
+        for entry in self._parse_fdb(data.get("fdb", "")):
+            key = (entry["mac"], entry["port"], entry["vlan"])
+            if key in seen:
+                continue
+            seen.add(key)
+            entry["ip"] = neighbours.get(entry["mac"], {}).get("ip", "")
+            mac_table.append(entry)
+
+        known_macs = {e["mac"] for e in mac_table}
+        for mac, info in neighbours.items():
+            if mac in known_macs or info["dev"] not in port_names:
+                continue
+            mac_table.append({
+                "mac": mac,
+                "type": "dynamic",
+                "port": info["dev"],
+                "vlan": "1",
+                "ip": info["ip"],
+            })
+
+        vm_mac_map = {}
+        for entry in mac_table:
+            label = port_vm_labels.get(entry["port"])
+            if label:
+                vm_mac_map[entry["mac"].replace(":", "")] = label
+
+        return mac_table, vm_mac_map
+
+    def _parse_scraped_data(self, data):
+        interfaces = data.get("interfaces", {})
+        vm_names = data.get("vm_names", {})
+        addresses = data.get("addresses", {})
+
+        selected = self._select_ports(interfaces)
+
+        # Guest interface labels are resolved for every interface, not just the
+        # selected ports, so the topology can still identify VM/LXC MACs when
+        # guest ports are hidden.
+        port_vm_labels = {}
+        for dev in interfaces:
+            label = self._vm_label(dev, vm_names)
+            if label:
+                port_vm_labels[dev] = label
+
+        ports, max_mtu, igmp_enabled = [], 1500, False
+
+        for dev in selected:
+            info = interfaces[dev]
+            status = self._link_status(info)
+            speed_mbps = self._resolve_speed(dev, info, interfaces)
+            duplex = (info.get("duplex") or "").strip().lower()
+            duplex = duplex.capitalize() if duplex in ("full", "half") else ""
+            vm_label = port_vm_labels.get(dev)
+
+            max_mtu = max(max_mtu, info.get("mtu", 1500))
+            if info.get("bridge") and info.get("multicast_snooping") == 1:
+                igmp_enabled = True
+
+            stats = info.get("stats", {})
+            ports.append({
+                "port": dev,
+                "status": status,
+                "link": "Link Up" if status == "up" else "Link Down",
+                "speed": self._format_speed(speed_mbps),
+                "duplex": duplex if status == "up" else "",
+                "flow_control": "",
+                "tx_packets": stats.get("tx_packets", 0),
+                "rx_packets": stats.get("rx_packets", 0),
+                "tx_bytes": stats.get("tx_bytes", 0),
+                "rx_bytes": stats.get("rx_bytes", 0),
+                "tx_errors": stats.get("tx_errors", 0),
+                "rx_errors": stats.get("rx_errors", 0),
+                "vm_name": vm_label,
+                "interface": dev,
+                "mtu": info.get("mtu", 1500),
+                "mac": info.get("mac", ""),
+                "addresses": addresses.get(dev, []),
+            })
+
+        mac_table, vm_mac_map = self._build_mac_table(
+            data, set(selected), port_vm_labels)
+
+        firmware = data.get("kernel", "")
+        if data.get("pve_version"):
+            firmware = f"{firmware} / {data['pve_version']}" if firmware else data["pve_version"]
+
+        return {
+            "name": self.name,
+            "ip": self.ip,
+            "model": data.get("distro", "Linux"),
+            "hostname": data.get("hostname", ""),
+            "mac": self._primary_mac(interfaces, selected, addresses),
+            "uptime": data.get("uptime", ""),
+            "firmware": firmware,
+            "ports": ports,
+            "mac_table": mac_table,
+            "vm_mac_map": vm_mac_map,
+            "dhcp_snooping": {"enabled": False, "ports": {}},
+            "igmp": {"enabled": igmp_enabled, "entries": []},
+            "jumbo_frame": {
+                "enabled": max_mtu > 1500,
+                "size": f"{max_mtu}Bytes" if max_mtu > 1500 else "Disabled",
+            },
+            "timestamp": time.time(),
+        }
+
+    def _primary_mac(self, interfaces, selected, addresses):
+        """Pick the MAC that best identifies the host."""
+        def has_routable_ip(dev):
+            return any(not a.lower().startswith(("fe80:", "127.", "::1"))
+                       for a in addresses.get(dev, []))
+
+        candidates = [self.bridge] if self.bridge else []
+        candidates += [d for d in selected if has_routable_ip(d)]
+        candidates += [d for d in selected if interfaces.get(d, {}).get("bridge")]
+        candidates += [d for d in selected if interfaces.get(d, {}).get("physical")]
+        for dev in candidates:
+            mac = interfaces.get(dev, {}).get("mac", "")
+            if mac and mac != "00:00:00:00:00:00":
+                return mac
+        return ""
+
+    def _fallback(self):
+        return {
+            "name": self.name,
+            "ip": self.ip,
+            "model": "Linux",
+            "hostname": "",
+            "mac": "",
+            "uptime": "",
+            "firmware": "",
+            "ports": [{"port": str(i), "status": "unknown", "speed": "",
+                       "link": "Unknown", "duplex": "", "flow_control": "",
+                       "tx_packets": 0, "rx_packets": 0,
+                       "tx_bytes": 0, "rx_bytes": 0,
+                       "vm_name": None, "interface": ""}
+                      for i in range(1, self.port_count + 1)],
+            "mac_table": [],
+            "vm_mac_map": {},
+            "dhcp_snooping": {"enabled": False, "ports": {}},
+            "igmp": {"enabled": False, "entries": []},
+            "jumbo_frame": {"enabled": False, "size": "Disabled"},
+            "timestamp": time.time(),
+        }
+
+
 class FritzBoxScraper:
     def __init__(self, config):
         self.name = config["name"]
@@ -2535,6 +3129,8 @@ def scrape_switch(config):
     model = config.get("model", "").lower()
     if model in ["openvswitch", "ovs"]:
         scraper = OVSScraper(config)
+    elif model in ["linux", "proxmox", "debian", "ubuntu"]:
+        scraper = LinuxScraper(config)
     elif model == "fritzbox":
         scraper = FritzBoxScraper(config)
     else:
