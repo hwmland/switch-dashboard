@@ -1277,6 +1277,9 @@ class HCSwitchScraper:
             template = self._load_template()
             if template:
                 mac_cfg = template.get("mac_table", {})
+                if mac_cfg.get("enabled", True) is False:
+                    logger.debug(f"MAC table scraping is disabled for {self.ip}")
+                    return []
                 if mac_cfg:
                     try:
                         res = self._scrape_mac_table_with_template(mac_cfg)

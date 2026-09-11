@@ -68,3 +68,6 @@ statistics:
   counter_stride: 4
   tx_packets_offset: 0
   rx_packets_offset: 2
+
+mac_table:
+  enabled: false
